@@ -1,0 +1,408 @@
+diff --git a/.gitignore b/.gitignore
+index 9934134..de7d903 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,4 @@
++.DS_Store
+ *.pyc
+ *~
+ *.egg-info
+diff --git a/simuvex/plugins/scratch.py b/simuvex/plugins/scratch.py
+index cce8b2b..f28705d 100644
+--- a/simuvex/plugins/scratch.py
++++ b/simuvex/plugins/scratch.py
+@@ -65,7 +65,7 @@ class SimStateScratch(SimStatePlugin):
+ 
+         # priveleges
+         self._priv_stack = [False]
+-
++    
+     @property
+     def priv(self):
+         return self._priv_stack[-1]
+@@ -143,6 +143,29 @@ class SimStateScratch(SimStatePlugin):
+         self.state = s
+         self.jumpkind = j # preserve jumpkind - "what is the previous jumpkind" is an important question sometimes
+ 
++    def is_var_tainted(self, var):
++        lst = map(lambda x:x.split('_')[0], list(self.state.se.variables(var)))
++        for ll in lst:
++            if 'arg' in ll:
++                return True
++        return False
++
++    def is_addr_tainted(self, addr, taint_addr=0x20000, taint_size=0x20000):
++        if self.state.se.symbolic(addr):
++            if self.is_var_tainted(addr):
++                return True
++        else:
++            if addr.args[0] >= taint_addr and addr.args[0] < taint_addr + taint_size:
++                return True
++        return False
++    
++    def is_addr_contents_tainted(self, addr):
++        m = self.state.memory.load(addr, 4)
++        if not m.symbolic:
++            return False
++        return self.is_var_tainted(m)
++
++
+ from ..s_action import SimActionObject, SimActionData
+ from ..s_errors import SimValueError
+ from .. import s_options as o
+diff --git a/simuvex/plugins/symbolic_memory.py b/simuvex/plugins/symbolic_memory.py
+index d1dda08..a8f27de 100644
+--- a/simuvex/plugins/symbolic_memory.py
++++ b/simuvex/plugins/symbolic_memory.py
+@@ -54,6 +54,9 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
+         # set up the strategies
+         self.read_strategies = read_strategies
+         self.write_strategies = write_strategies
++        
++        # keep track of currently active memory buffers and their bounds
++        self.mem_bounds = {}
+ 
+ 
+     #
+@@ -75,7 +78,10 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
+             stack_region_map=self._stack_region_map,
+             generic_region_map=self._generic_region_map
+         )
+-
++        
++        # malloc-ed bounds
++        c.mem_bounds = self.mem_bounds.copy()
++        
+         return c
+ 
+     #
+@@ -482,7 +488,8 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
+ 
+     def _load(self, dst, size, condition=None, fallback=None):
+         if self.state.se.symbolic(size):
+-            l.warning("Concretizing symbolic length. Much sad; think about implementing.")
++            _,max_size = self._resolve_size_range(size)
++            l.warning("Concretizing symbolic length. Much sad; think about implementing. dst:%s  size:%s  max_size:%x", dst, size, max_size)
+ 
+         # for now, we always load the maximum size
+         _,max_size = self._resolve_size_range(size)
+diff --git a/simuvex/procedures/tz_arm32/__init__.py b/simuvex/procedures/tz_arm32/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/simuvex/procedures/tz_arm32/free.py b/simuvex/procedures/tz_arm32/free.py
+new file mode 100644
+index 0000000..d2f4a10
+--- /dev/null
++++ b/simuvex/procedures/tz_arm32/free.py
+@@ -0,0 +1,21 @@
++import simuvex
++from simuvex.s_type import SimTypeTop
++
++######################################
++# free
++######################################
++class free(simuvex.SimProcedure):
++    #pylint:disable=arguments-differ
++
++    def run(self, ptr): #pylint:disable=unused-argument
++        self.argument_types = {0: self.ty_ptr(SimTypeTop())}
++        
++        # Free memory by first checking for a previously allocated buffer
++        if not ptr.args[0] in self.state.memory.mem_bounds:
++            print '\n[+] *** Symbolic VULN: double-free'
++            print '[-]     IP: 0x%08x' % self.state.regs.lr.args[0]
++            print '[-]     ptr: ', ptr
++        else:
++            del self.state.memory.mem_bounds[ptr.args[0]]
++        
++        return self.state.se.Unconstrained('free', self.state.arch.bits)
+diff --git a/simuvex/procedures/tz_arm32/malloc.py b/simuvex/procedures/tz_arm32/malloc.py
+new file mode 100644
+index 0000000..8831e4d
+--- /dev/null
++++ b/simuvex/procedures/tz_arm32/malloc.py
+@@ -0,0 +1,39 @@
++import simuvex
++from simuvex.s_type import SimTypeLength, SimTypeTop
++import itertools
++
++######################################
++# malloc
++######################################
++
++malloc_mem_counter = itertools.count()
++
++PAGE_ALIGN = 0x1000
++
++class malloc(simuvex.SimProcedure):
++    #pylint:disable=arguments-differ
++
++    def run(self, sim_size):
++        self.argument_types = {0: SimTypeLength(self.state.arch)}
++        self.return_type = self.ty_ptr(SimTypeTop(sim_size))
++
++        if self.state.se.symbolic(sim_size):
++            size = self.state.se.max_int(sim_size)
++            if size > self.state.libc.max_variable_size:
++                size = self.state.libc.max_variable_size
++            
++            # If sim_size is symbolic/tainted, we'll add a constraint for its 
++            # bounds so that we can check for exploitability later.
++            self.state.add_constraints(sim_size <= size)
++            
++        else:
++            size = self.state.se.any_int(sim_size)
++
++        addr = self.state.libc.heap_location
++        self.state.libc.heap_location += size
++        self.state.libc.heap_location += (PAGE_ALIGN - (self.state.libc.heap_location % PAGE_ALIGN))
++        
++        # Store bounds
++        self.state.memory.mem_bounds[addr] = size
++        
++        return addr
+diff --git a/simuvex/procedures/tz_arm32/memcpy.py b/simuvex/procedures/tz_arm32/memcpy.py
+new file mode 100644
+index 0000000..b192d56
+--- /dev/null
++++ b/simuvex/procedures/tz_arm32/memcpy.py
+@@ -0,0 +1,84 @@
++import simuvex
++from simuvex.s_type import SimTypeTop, SimTypeLength
++
++import logging
++l = logging.getLogger("simuvex.procedures.tz_arm32.memcpy")
++
++class memcpy(simuvex.SimProcedure):
++    #pylint:disable=arguments-differ
++
++    def check(self, dst_addr, src_addr, limit):
++        """ TODO: To refactor this.
++        """
++        taint_dst = self.state.scratch.is_addr_tainted(dst_addr)
++        taint_src = self.state.scratch.is_addr_tainted(src_addr)
++        taint_src_contents = self.state.scratch.is_addr_contents_tainted(src_addr)
++        taint_lim = self.state.scratch.is_var_tainted(limit)
++        
++        # Case 1: Controllable length + controllable src addr or dst addr
++        # Case 2: Controllable length + controllable src mem contents
++        #         - Caveat: Now only check the first 4 bytes
++        if (taint_lim and (taint_dst or taint_src)) or \
++            (taint_lim and taint_src_contents):
++            self.state.simplify()
++            if dst_addr.concrete:
++                offset = dst_addr.args[0] % 0x10000
++                dst_addr_align = dst_addr.args[0] - offset
++                bnds = self.state.memory.mem_bounds[dst_addr_align]
++                state2 = self.state.copy()
++                state2.add_constraints(limit > bnds - offset)
++                if not state2.satisfiable():
++                    return
++                bnds = hex(bnds)
++            else:
++                bnds = '-'
++            
++            print '\n[+] *** Symbolic VULN: memcpy'
++            print '[-]     IP: 0x%08x' % self.state.regs.lr.args[0]
++            print '[-]     #cons: %d' % (len(self.state.se.constraints)), '-', self.state.satisfiable()
++            print '[-]       - dst (bnds: %s): ' % (bnds), dst_addr, taint_dst
++            print '[-]       - src: ', src_addr, taint_src
++            print '[-]       - *src:', self.state.memory.load(src_addr, 4), taint_src_contents
++            print '[-]       - lim (max: 0x%x): ' % (self.state.se.max_int(limit)), limit, taint_lim
++            '''
++            print '[-]   ---'
++            for i, c in enumerate(self.state.se.constraints):
++                print '[-]   Constraint[%d]:' % i, list(self.state.se.variables(c))
++                print '          ', c
++            print '[-]   ---'
++            '''
++
++    def run(self, dst_addr, src_addr, limit):
++        self.check(dst_addr, src_addr, limit)
++
++        # TODO: look into smarter types here
++        self.argument_types = {0: self.ty_ptr(SimTypeTop()),
++                               1: self.ty_ptr(SimTypeTop()),
++                               2: SimTypeLength(self.state.arch)}
++        self.return_type = self.ty_ptr(SimTypeTop())
++
++        if not self.state.se.symbolic(limit):
++            # not symbolic so we just take the value
++            conditional_size = self.state.se.any_int(limit)
++        else:
++            # constraints on the limit are added during the store
++            max_memcpy_size = self.state.libc.max_memcpy_size
++            max_limit = self.state.se.max_int(limit)
++            conditional_size = max(self.state.se.min_int(limit), min(max_limit, max_memcpy_size))
++            if max_limit > max_memcpy_size and conditional_size < max_limit:
++                l.warning("memcpy upper bound of %#x outside limit, limiting to %#x instead",
++                          max_limit, conditional_size)
++
++        l.debug("Memcpy running with conditional_size %#x", conditional_size)
++
++        if conditional_size > 0:
++            src_mem = self.state.memory.load(src_addr, conditional_size, endness='Iend_BE')
++            if ABSTRACT_MEMORY in self.state.options:
++                self.state.memory.store(dst_addr, src_mem, size=conditional_size, endness='Iend_BE')
++            else:
++                self.state.memory.store(dst_addr, src_mem, size=limit, endness='Iend_BE')
++
++
++        return dst_addr
++
++from simuvex.s_options import ABSTRACT_MEMORY
+diff --git a/simuvex/procedures/tz_arm32/memset2.py b/simuvex/procedures/tz_arm32/memset2.py
+new file mode 100644
+index 0000000..acc9c7c
+--- /dev/null
++++ b/simuvex/procedures/tz_arm32/memset2.py
+@@ -0,0 +1,87 @@
++import simuvex
++from simuvex.s_type import SimTypeTop, SimTypeInt, SimTypeLength
++
++import logging
++l = logging.getLogger("simuvex.procedures.tz_arm32.memset2")
++
++######################################
++# memset2
++######################################
++
++class memset2(simuvex.SimProcedure):
++    #pylint:disable=arguments-differ
++
++    @staticmethod
++    def _repeat_bytes(byt, rep):
++        """
++        Get a long number for a byte being repeated for many times. This is part of the effort of optimizing
++        performance of angr's memory operations.
++
++        :param int byt: the byte to repeat
++        :param int rep: times to repeat the byte
++        :return: a long integer representing the repeating bytes
++        ;rtype: int
++        """
++
++        if rep == 1:
++            return byt
++
++        remainder = rep % 2
++        quotient = rep / 2
++
++        r_ = memset2._repeat_bytes(byt, quotient)
++        if remainder == 1:
++            r = r_ << ((quotient + 1) * 8)
++            r |= (r_ << 8) + byt
++        else:
++            r = r_ << (quotient * 8)
++            r |= r_
++        return r
++
++    def check(self, dst_addr, num):
++        taint_dst = self.state.scratch.is_addr_tainted(dst_addr)
++        taint_num = self.state.scratch.is_var_tainted(num)
++        if taint_num and taint_dst:
++            self.state.simplify()
++            print '\n[+] *** Symbolic VULN: memset2'
++            print '[-]     IP: 0x%08x' % self.state.regs.lr.args[0]
++            print '[-]     #cons: %d' % (len(self.state.se.constraints)), '-', self.state.satisfiable()
++            print '[-]       dst:', dst_addr, taint_dst
++            print '[-]       num:', num, taint_num
++
++    def run(self, dst_addr, num, char):
++        self.check(dst_addr, num)
++
++        char = char[7:0]
++
++        self.argument_types = {0: self.ty_ptr(SimTypeTop()),
++                       1: SimTypeInt(32, True), # ?
++                       2: SimTypeLength(self.state.arch)}
++        self.return_type = self.ty_ptr(SimTypeTop())
++
++        if self.state.se.symbolic(num):
++            l.debug("symbolic length")
++            max_size = self.state.se.min_int(num) + self.state.libc.max_buffer_size
++            write_bytes = self.state.se.Concat(*([ char ] * max_size))
++            self.state.memory.store(dst_addr, write_bytes, size=num)
++        else:
++            max_size = self.state.se.any_int(num)
++            if max_size == 0:
++                return dst_addr
++
++            if self.state.se.symbolic(char):
++                l.debug("symbolic char")
++                write_bytes = self.state.se.Concat(*([char] * max_size))
++            else:
++                # Concatenating many bytes is slow, so some sort of optimization is required
++                if char._model_concrete.value == 0:
++                    write_bytes = self.state.se.BVV(0, max_size * 8)
++                else:
++                    rb = memset2._repeat_bytes(char._model_concrete.value, max_size)
++                    write_bytes = self.state.se.BVV(rb, max_size * 8)
++
++            self.state.memory.store(dst_addr, write_bytes)
++
++            l.debug("memset2 writing %d bytes", max_size)
++
++        return dst_addr
+diff --git a/simuvex/procedures/tz_arm32/strlen.py b/simuvex/procedures/tz_arm32/strlen.py
+new file mode 100644
+index 0000000..67f5e5b
+--- /dev/null
++++ b/simuvex/procedures/tz_arm32/strlen.py
+@@ -0,0 +1,56 @@
++import claripy
++import simuvex
++from simuvex.s_type import SimTypeString, SimTypeLength
++
++import logging
++l = logging.getLogger("simuvex.procedures.tz_arm32.strlen")
++
++class strlen(simuvex.SimProcedure):
++    #pylint:disable=arguments-differ
++
++    def run(self, s):
++        #pylint:disable=attribute-defined-outside-init
++
++        self.argument_types = {0: self.ty_ptr(SimTypeString())}
++        self.return_type = SimTypeLength(self.state.arch)
++
++        max_symbolic_bytes = self.state.libc.buf_symbolic_bytes
++        max_str_len = self.state.libc.max_str_len
++
++        if self.state.mode == 'static':
++
++            self.max_null_index = [  ]
++
++            # Make sure to convert s to ValueSet
++            s_list = self.state.memory.normalize_address(s, convert_to_valueset=True)
++
++            length = self.state.se.ESI(self.state.arch.bits)
++            for s_ptr in s_list:
++
++                r, c, i = self.state.memory.find(s, self.state.se.BVV(0, 8), max_str_len, max_symbolic_bytes=max_symbolic_bytes)
++
++                self.max_null_index = max(self.max_null_index + i)
++
++                # Convert r to the same region as s
++                r_list = self.state.memory.normalize_address(r, convert_to_valueset=True, target_region=s_ptr._model_vsa.regions.keys()[0])
++
++                for r_ptr in r_list:
++                    length = length.union(r_ptr - s_ptr)
++
++            return length
++
++        else:
++            search_len = max_str_len
++            r, c, i = self.state.memory.find(s, self.state.se.BVV(0, 8), search_len, max_symbolic_bytes=max_symbolic_bytes)
++
++            # try doubling the search len and searching again
++            while all(con.is_false() for con in c):
++                search_len *= 2
++                r, c, i = self.state.memory.find(s, self.state.se.BVV(0, 8), search_len, max_symbolic_bytes=max_symbolic_bytes)
++                # stop searching after some reasonable limit
++                if search_len > 0x10000:
++                    raise simuvex.SimMemoryLimitError("strlen hit limit of 0x10000")
++
++            self.max_null_index = max(i)
++            self.state.add_constraints(*c)
++            return r - s
